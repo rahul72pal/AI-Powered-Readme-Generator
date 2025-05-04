@@ -216,6 +216,7 @@ const GITHUB_API_BASE = 'https://api.github.com';
 
 const headers = {
   Authorization: `token ${process.env.GITHUB_TOKEN}`,
+  Accept: 'application/vnd.github.mercy-preview+json',
 };
 
 
@@ -365,20 +366,20 @@ Make sure the formatting is Markdown compliant and cleanly readable also add the
 // });
 
 app.post('/get-repo-info', async (req, res) => {
-  const { repoLink , projectOverview  } = req.body;
+  const { repoLink, projectOverview } = req.body;
 
   try {
     const match = repoLink.match(/https:\/\/github\.com\/([^/]+)\/([^/]+)(\/)?/);
     if (!match) return res.status(400).json({ error: 'Invalid GitHub repository URL' });
 
-    const [_, owner, repo] = match;
+    const [, owner, repo] = match;
 
-    const getPackageJson = async (path) => {
+    const getPackageJson = async (path = '') => {
       try {
-        const pkgRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${path}/package.json`, { headers: {
-          ...headers,
-          Accept: 'application/vnd.github.mercy-preview+json',
-        }, });
+        const pkgRes = await axios.get(
+          `${GITHUB_API_BASE}/repos/${owner}/${repo}/contents/${path ? path + '/' : ''}package.json`,
+          { headers }
+        );
         const content = Buffer.from(pkgRes.data.content, 'base64').toString('utf-8');
         return JSON.parse(content);
       } catch {
@@ -386,53 +387,55 @@ app.post('/get-repo-info', async (req, res) => {
       }
     };
 
-    const [clientPkg, serverPkg] = await Promise.all([
-      getPackageJson("client"),
-      getPackageJson("server"),
-    ]);
-
     const getStackFromDeps = (pkg) => {
       if (!pkg) return null;
       const deps = Object.keys(pkg.dependencies || {});
       const devDeps = Object.keys(pkg.devDependencies || {});
-      return [...deps, ...devDeps];
+      return [...new Set([...deps, ...devDeps])];
     };
 
-    // Basic repo info
-    const repoRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}`, {headers: {
-      ...headers,
-      Accept: 'application/vnd.github.mercy-preview+json',
-    },});
+    // Get base repo info
+    const repoRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}`, { headers });
     const repoData = repoRes.data;
 
-    // Other metadata
-    const langRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/languages`, {headers: {
-      ...headers,
-      Accept: 'application/vnd.github.mercy-preview+json',
-    },});
-    const topicsRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/topics`, {
-      headers: {
-        ...headers,
-        Accept: 'application/vnd.github.mercy-preview+json',
-      },
-    });
+    // Get contents (root level)
+    const contentsRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/contents`, { headers });
+    const contents = contentsRes.data;
+    const files = contents.map(file => file.name);
 
-    const contentsRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/contents`, {
-      headers: {
-        ...headers,
-        Accept: 'application/vnd.github.mercy-preview+json',
-      },
-    });
-    const files = contentsRes.data.map(file => file.name);
+    // Get root package.json (if any)
+    const rootPackage = await getPackageJson();
 
+    // Dynamically check subfolders for package.json
+    const subfolderPkgs = {};
+    for (const file of contents) {
+      if (file.type === 'dir') {
+        const pkg = await getPackageJson(file.name);
+        if (pkg) {
+          subfolderPkgs[file.name] = pkg;
+        }
+      }
+    }
+
+    // Get language and topics
+    const langRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/languages`, { headers });
+    const topicsRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/topics`, { headers });
+
+    // Get readme (if available)
     let readmeContent = null;
     try {
-      const readmeRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/readme`, {headers: {
-        ...headers,
-        Accept: 'application/vnd.github.mercy-preview+json',
-      },});
+      const readmeRes = await axios.get(`${GITHUB_API_BASE}/repos/${owner}/${repo}/readme`, { headers });
       readmeContent = Buffer.from(readmeRes.data.content, 'base64').toString('utf-8');
     } catch {}
+
+    // Build tech stack summary
+    const techStacks = {
+      root: getStackFromDeps(rootPackage),
+    };
+
+    for (const [folder, pkg] of Object.entries(subfolderPkgs)) {
+      techStacks[folder] = getStackFromDeps(pkg);
+    }
 
     const repoInfo = {
       name: repoData.name,
@@ -448,20 +451,18 @@ app.post('/get-repo-info', async (req, res) => {
       languages: Object.keys(langRes.data),
       files,
       readme: readmeContent,
-      techStacks: {
-        client: getStackFromDeps(clientPkg),
-        server: getStackFromDeps(serverPkg),
-      }
+      techStacks,
     };
 
-    const readmeContentGenerated = await generateReadmeContent(repoInfo, projectOverview || repoInfo.description );
+    const readmeContentGenerated = await generateReadmeContent(repoInfo, projectOverview || repoInfo.description);
     if (!readmeContentGenerated) {
-      res.status(500).json({ error: "Failed to generate README content" });
+      res.status(500).json({ error: 'Failed to generate README content' });
     } else {
       res.json({ success: true, readme: readmeContentGenerated });
     }
 
   } catch (error) {
+    console.error('Error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to fetch repo data', details: error.message });
   }
 });
